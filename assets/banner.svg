@@ -1,0 +1,53 @@
+<svg width="1600" height="560" viewBox="0 0 1600 560" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">sdkcheck banner</title>
+  <desc id="desc">A dark banner for sdkcheck with a large wordmark and a single-line subtitle about auditing whether an agent can follow product docs.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="560" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#070C16"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="wordmark" x1="92" y1="154" x2="1328" y2="154" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FBFF"/>
+      <stop offset="0.6" stop-color="#D9E7FF"/>
+      <stop offset="1" stop-color="#8CCBFF"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="92" y1="104" x2="290" y2="104" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34D399"/>
+      <stop offset="1" stop-color="#60A5FA"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1318 112) rotate(132.144) scale(490.594 887.224)">
+      <stop stop-color="#163D5A"/>
+      <stop offset="1" stop-color="#163D5A" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500&amp;family=JetBrains+Mono:wght@700;800&amp;display=swap');
+    .wordmark {
+      font-family: "JetBrains Mono", Consolas, monospace;
+      font-size: 208px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    .subtitle {
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      font-size: 30px;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+    .supporting {
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      font-size: 18px;
+      font-weight: 400;
+      letter-spacing: 0;
+    }
+  </style>
+
+  <rect width="1600" height="560" rx="28" fill="url(#bg)"/>
+  <rect width="1600" height="560" rx="28" fill="url(#glow)"/>
+  <rect x="1" y="1" width="1598" height="558" rx="27" stroke="#22314E"/>
+
+  <rect x="92" y="96" width="198" height="6" rx="3" fill="url(#accent)"/>
+  <text x="92" y="316" fill="url(#wordmark)" class="wordmark">sdkcheck</text>
+  <text x="98" y="386" fill="#D8E6F9" class="subtitle">Audit whether an agent can actually follow your product docs.</text>
+  <text x="98" y="430" fill="#8FA9C8" class="supporting">Runs real commands in isolation and leaves evidence when something breaks.</text>
+</svg>
