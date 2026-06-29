@@ -1,0 +1,41 @@
+name: Docker dogfood
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  co-op-translator:
+    name: Co-op Translator Docker scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run deterministic dogfood
+        run: cargo run --locked -- run --recipe co-op-translator --backend docker --fake-openai --output reports/co-op-translator-docker.md --json-output reports/co-op-translator-docker.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: co-op-translator-report
+          path: |
+            reports/co-op-translator-docker.md
+            reports/co-op-translator-docker.json
+          if-no-files-found: ignore

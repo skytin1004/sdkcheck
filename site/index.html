@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>sdkcheck</title>
+    <meta name="description" content="Docker-first docs CI for AI-agent-era product workflows.">
+    <meta property="og:title" content="sdkcheck">
+    <meta property="og:description" content="Turn product docs into executable QA scenarios.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://sdkcheck.com">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">sdkcheck</a>
+      <nav aria-label="Primary navigation">
+        <a href="https://github.com/skytin1004/sdkcheck">GitHub</a>
+        <a href="https://github.com/skytin1004/sdkcheck/releases">Releases</a>
+        <a href="https://github.com/skytin1004/sdkcheck/blob/main/docs/installation.md">Install</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-label="sdkcheck overview">
+        <div class="hero-copy">
+          <p class="eyebrow">Docker-first docs CI</p>
+          <h1>sdkcheck</h1>
+          <p class="lede">Test product docs the way AI agents use them: execute the workflow, capture command evidence, and classify whether the docs, product, or environment failed.</p>
+          <div class="actions" aria-label="Primary actions">
+            <a class="button primary" href="https://github.com/skytin1004/sdkcheck">View Repository</a>
+            <a class="button secondary" href="https://github.com/skytin1004/sdkcheck/blob/main/docs/getting-started.md">Get Started</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="band" aria-label="Install sdkcheck">
+        <div class="content-grid">
+          <div>
+            <h2>Run the first dogfood scenario</h2>
+            <p>sdkcheck currently ships a Co-op Translator recipe that clones the project, creates an isolated Python environment, runs the documented CLI path, and writes Markdown plus JSON reports.</p>
+          </div>
+          <pre><code>cargo install --locked --git https://github.com/skytin1004/sdkcheck.git sdkcheck
+
+sdkcheck run --recipe co-op-translator --backend docker --fake-openai</code></pre>
+        </div>
+      </section>
+
+      <section class="proof" aria-label="What sdkcheck reports">
+        <article>
+          <h2>Evidence for CI</h2>
+          <p>Each report includes scenario steps, docs observations, secret names, command stdout/stderr, timeout state, generated files, failure classification, and reproduction command.</p>
+        </article>
+        <article>
+          <h2>Built for API-key workflows</h2>
+          <p>Secrets are passed only by explicit environment variable name. Values are masked before command output is written to reports.</p>
+        </article>
+        <article>
+          <h2>Open source core</h2>
+          <p>sdkcheck starts Apache-2.0 with a Rust CLI, Docker-first execution, GitHub release binaries, and a narrow MVP recipe.</p>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>

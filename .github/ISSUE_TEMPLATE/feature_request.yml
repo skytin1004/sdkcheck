@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a new sdkcheck capability.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What product/docs QA pain would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should sdkcheck do?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Link to a failing workflow, report, or product docs example if available.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - recipe
+        - runner
+        - report
+        - security
+        - LLM gateway
+        - documentation
+        - release
+        - other
