@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: sdkcheck
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: sdkcheck
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: sdkcheck
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: sdkcheck.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          artifact="sdkcheck-${tag}-${{ matrix.target }}"
+          mkdir -p "dist/${artifact}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${artifact}/"
+          cp README.md LICENSE CHANGELOG.md "dist/${artifact}/"
+          tar -czf "dist/${artifact}.tar.gz" -C dist "${artifact}"
+          shasum -a 256 "dist/${artifact}.tar.gz" > "dist/${artifact}.tar.gz.sha256"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          $artifact = "sdkcheck-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist\$artifact" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" "dist\$artifact\"
+          Copy-Item -Path README.md, LICENSE, CHANGELOG.md -Destination "dist\$artifact\"
+          Compress-Archive -Path "dist\$artifact\*" -DestinationPath "dist\$artifact.zip" -Force
+          $hash = (Get-FileHash "dist\$artifact.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$artifact.zip" | Set-Content -NoNewline "dist\$artifact.zip.sha256"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdkcheck-${{ steps.tag.outputs.tag }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build combined checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 | sort > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: sdkcheck ${{ steps.tag.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS

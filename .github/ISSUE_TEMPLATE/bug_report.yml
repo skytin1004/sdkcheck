@@ -1,0 +1,65 @@
+name: Bug report
+description: Report a reproducible sdkcheck failure.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include real API keys or private customer logs. Replace secrets with placeholders before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed?
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - docker
+        - local
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: Paste the sdkcheck command without secret values.
+      placeholder: sdkcheck run --repo https://github.com/acme/product.git --goal "Install the product and complete the quickstart." --env OPENAI_API_KEY --env OPENAI_CHAT_MODEL_ID
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Rust version, Docker version, sdkcheck version or commit.
+      placeholder: |
+        OS:
+        rustc --version:
+        docker version:
+        sdkcheck commit:
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Report excerpt
+      description: Paste only the relevant redacted report excerpt.
+      render: text

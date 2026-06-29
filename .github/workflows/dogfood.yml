@@ -1,0 +1,51 @@
+name: Internal dogfood
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  internal-dogfood:
+    name: Internal Docker dogfood audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run internal dogfood
+        if: ${{ secrets.SDKCHECK_AGENT_API_KEY != '' && vars.SDKCHECK_AGENT_MODEL != '' && secrets.OPENAI_API_KEY != '' && vars.OPENAI_CHAT_MODEL_ID != '' }}
+        env:
+          SDKCHECK_AGENT_API_KEY: ${{ secrets.SDKCHECK_AGENT_API_KEY }}
+          SDKCHECK_AGENT_MODEL: ${{ vars.SDKCHECK_AGENT_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_CHAT_MODEL_ID: ${{ vars.OPENAI_CHAT_MODEL_ID }}
+        run: cargo run --locked -- run --repo https://github.com/Azure/co-op-translator.git --docs README.md --docs docs/cli.md --docs docs/configuration.md --goal "Install Co-op Translator from the docs, verify the documented CLI entry points, run a Markdown translation to Korean, and confirm translated Markdown files are written." --success "translate --help exits successfully." --success "co-op-review --help exits successfully." --success "The run produces translated Markdown output under translations/ko/." --backend docker --env OPENAI_API_KEY --env OPENAI_CHAT_MODEL_ID --output reports/dogfood-docker.md --json-output reports/dogfood-docker.json
+
+      - name: Skip without model credentials
+        if: ${{ secrets.SDKCHECK_AGENT_API_KEY == '' || vars.SDKCHECK_AGENT_MODEL == '' || secrets.OPENAI_API_KEY == '' || vars.OPENAI_CHAT_MODEL_ID == '' }}
+        run: echo "Skipping dogfood audit because SDKCHECK_AGENT_API_KEY, SDKCHECK_AGENT_MODEL, OPENAI_API_KEY, or OPENAI_CHAT_MODEL_ID is not configured."
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dogfood-report
+          path: |
+            reports/dogfood-docker.md
+            reports/dogfood-docker.json
+          if-no-files-found: ignore
