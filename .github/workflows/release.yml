@@ -89,7 +89,7 @@ jobs:
           "$hash *$artifact.zip" | Set-Content -NoNewline "dist\$artifact.zip.sha256"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdkcheck-${{ steps.tag.outputs.tag }}-${{ matrix.target }}
           path: |
