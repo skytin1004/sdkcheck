@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::audits::docs::{self, DocsAuditOptions};
+use crate::audits::docs::{
+    self, AgentProvider, DEFAULT_AZURE_OPENAI_API_VERSION, DocsAuditOptions,
+};
 use crate::runner::Backend;
 
 #[derive(Debug, Parser)]
@@ -27,7 +29,7 @@ enum Commands {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  sdkcheck run --docs https://docs.example.com/api/latest/ --goal \"Install the SDK and make one successful example API request.\" --env EXAMPLE_API_KEY --env EXAMPLE_APP_KEY --env EXAMPLE_SITE\n  sdkcheck run --docs README.md --docs docs/quickstart.md --goal \"Install the SDK and complete the quickstart.\" --env ACME_API_KEY\n  sdkcheck run --docs docs/quickstart.md --workspace . --goal \"Install from this checkout and run the documented example.\" --backend local\n"
+    after_help = "Examples:\n  sdkcheck run --docs https://docs.example.com/api/latest/ --goal \"Install the SDK and make one successful example API request.\" --env EXAMPLE_API_KEY --env EXAMPLE_APP_KEY --env EXAMPLE_SITE\n  sdkcheck run --docs README.md --docs docs/quickstart.md --goal \"Install the SDK and complete the quickstart.\" --env ACME_API_KEY\n  sdkcheck run --docs docs/quickstart.md --workspace . --goal \"Install from this checkout and run the documented example.\" --backend local\n  sdkcheck run --agent-provider azure-openai --docs docs/quickstart.md --goal \"Complete the documented setup flow.\"\n"
 )]
 struct RunCommand {
     #[arg(
@@ -88,7 +90,14 @@ struct RunCommand {
 
     #[arg(
         long,
-        help = "OpenAI-compatible base URL for the audit agent. Defaults to SDKCHECK_AGENT_BASE_URL or https://api.openai.com/v1."
+        value_enum,
+        help = "Audit agent provider. Defaults to SDKCHECK_AGENT_PROVIDER or openai-compatible."
+    )]
+    agent_provider: Option<AgentProvider>,
+
+    #[arg(
+        long,
+        help = "OpenAI-compatible base URL for the audit agent. Used by --agent-provider openai-compatible. Defaults to SDKCHECK_AGENT_BASE_URL or https://api.openai.com/v1."
     )]
     agent_base_url: Option<String>,
 
@@ -107,6 +116,31 @@ struct RunCommand {
 
     #[arg(
         long,
+        help = "Azure OpenAI endpoint for the audit agent. Can also come from SDKCHECK_AGENT_AZURE_OPENAI_ENDPOINT."
+    )]
+    agent_azure_endpoint: Option<String>,
+
+    #[arg(
+        long,
+        help = "Azure OpenAI deployment name for the audit agent. Defaults to SDKCHECK_AGENT_AZURE_OPENAI_DEPLOYMENT or SDKCHECK_AGENT_MODEL."
+    )]
+    agent_azure_deployment: Option<String>,
+
+    #[arg(
+        long,
+        help = "Azure OpenAI API version for the audit agent. Defaults to SDKCHECK_AGENT_AZURE_OPENAI_API_VERSION or 2024-10-21."
+    )]
+    agent_azure_api_version: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "SDKCHECK_AGENT_AZURE_OPENAI_API_KEY",
+        help = "Environment variable name that stores the Azure OpenAI audit agent API key."
+    )]
+    agent_azure_api_key_env: String,
+
+    #[arg(
+        long,
         default_value_t = 12,
         help = "Maximum agent steps before sdkcheck stops the audit."
     )]
@@ -119,6 +153,13 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Commands::Run(command) => {
+            let agent_provider = if let Some(provider) = command.agent_provider {
+                provider
+            } else if let Ok(value) = std::env::var("SDKCHECK_AGENT_PROVIDER") {
+                AgentProvider::parse(&value)?
+            } else {
+                AgentProvider::OpenAiCompatible
+            };
             let agent_base_url = command
                 .agent_base_url
                 .or_else(|| std::env::var("SDKCHECK_AGENT_BASE_URL").ok())
@@ -127,6 +168,16 @@ pub fn run() -> Result<()> {
                 .agent_model
                 .or_else(|| std::env::var("SDKCHECK_AGENT_MODEL").ok())
                 .unwrap_or_default();
+            let agent_azure_endpoint = command
+                .agent_azure_endpoint
+                .or_else(|| std::env::var("SDKCHECK_AGENT_AZURE_OPENAI_ENDPOINT").ok());
+            let agent_azure_deployment = command
+                .agent_azure_deployment
+                .or_else(|| std::env::var("SDKCHECK_AGENT_AZURE_OPENAI_DEPLOYMENT").ok());
+            let agent_azure_api_version = command
+                .agent_azure_api_version
+                .or_else(|| std::env::var("SDKCHECK_AGENT_AZURE_OPENAI_API_VERSION").ok())
+                .unwrap_or_else(|| DEFAULT_AZURE_OPENAI_API_VERSION.to_string());
 
             let report = docs::run(DocsAuditOptions {
                 backend: command.backend,
@@ -139,9 +190,14 @@ pub fn run() -> Result<()> {
                 json_output: command.json_output.clone(),
                 timeout_seconds: command.timeout_seconds,
                 forwarded_env_names: command.forwarded_envs,
+                agent_provider,
                 agent_base_url,
                 agent_model,
                 agent_api_key_env: command.agent_api_key_env,
+                agent_azure_endpoint,
+                agent_azure_deployment,
+                agent_azure_api_version,
+                agent_azure_api_key_env: command.agent_azure_api_key_env,
                 max_steps: command.max_steps,
             })?;
 

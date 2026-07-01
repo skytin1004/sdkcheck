@@ -5,8 +5,12 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
+use clap::ValueEnum;
 use reqwest::Url;
 use reqwest::blocking::Client;
+use rig_core::client::CompletionClient;
+use rig_core::completion::Prompt;
+use rig_core::providers::{azure, openai};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -21,6 +25,41 @@ const MAX_FILE_READ_BYTES: usize = 12 * 1024;
 const MAX_AGENT_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_GENERATED_FILES: usize = 64;
 const MAX_AGENT_RESPONSE_TOKENS: u64 = 800;
+pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "2024-10-21";
+const AGENT_SYSTEM_PROMPT: &str = "You are sdkcheck's audit agent. Return one JSON object only.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AgentProvider {
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
+    #[value(name = "openai")]
+    OpenAi,
+    #[value(name = "azure-openai")]
+    AzureOpenAi,
+}
+
+impl AgentProvider {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai-compatible" | "openai_compatible" | "compatible" => Ok(Self::OpenAiCompatible),
+            "openai" | "open-ai" => Ok(Self::OpenAi),
+            "azure-openai" | "azure_openai" | "azure" | "aoai" => Ok(Self::AzureOpenAi),
+            value => Err(anyhow!(
+                "unsupported audit agent provider `{value}`; expected openai-compatible, openai, or azure-openai"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for AgentProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenAiCompatible => write!(formatter, "openai-compatible"),
+            Self::OpenAi => write!(formatter, "openai"),
+            Self::AzureOpenAi => write!(formatter, "azure-openai"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DocsAuditOptions {
@@ -34,9 +73,14 @@ pub struct DocsAuditOptions {
     pub json_output: Option<PathBuf>,
     pub timeout_seconds: u64,
     pub forwarded_env_names: Vec<String>,
+    pub agent_provider: AgentProvider,
     pub agent_base_url: String,
     pub agent_model: String,
     pub agent_api_key_env: String,
+    pub agent_azure_endpoint: Option<String>,
+    pub agent_azure_deployment: Option<String>,
+    pub agent_azure_api_version: String,
+    pub agent_azure_api_key_env: String,
     pub max_steps: u32,
 }
 
@@ -342,7 +386,7 @@ impl AgentLoop<'_> {
                             "sdkcheck could not get the next action from the audit agent: {error:#}"
                         ),
                         suggestions: vec![
-                            "Verify the audit agent endpoint, API key, and model, then retry the audit."
+                            "Verify the audit agent provider, API key, and model, then retry the audit."
                                 .to_string(),
                         ],
                         missing_envs: Vec::new(),
@@ -1043,6 +1087,9 @@ fn suggestions_for_report(
         if !finish.suggestions.is_empty() {
             return finish.suggestions.clone();
         }
+        if finish.verdict == AgentVerdict::Passed {
+            return Vec::new();
+        }
     }
 
     let mut suggestions = Vec::new();
@@ -1081,13 +1128,18 @@ fn reproduction_command(options: &DocsAuditOptions) -> String {
         shell_quote(&options.output.display().to_string()),
         "--timeout-seconds".to_string(),
         options.timeout_seconds.to_string(),
-        "--agent-base-url".to_string(),
-        shell_quote(&options.agent_base_url),
+        "--agent-provider".to_string(),
+        options.agent_provider.to_string(),
         "--agent-api-key-env".to_string(),
         options.agent_api_key_env.clone(),
         "--max-steps".to_string(),
         options.max_steps.to_string(),
     ];
+
+    if options.agent_provider == AgentProvider::OpenAiCompatible {
+        command.push("--agent-base-url".to_string());
+        command.push(shell_quote(&options.agent_base_url));
+    }
 
     for source in &options.docs {
         command.push("--docs".to_string());
@@ -1105,6 +1157,25 @@ fn reproduction_command(options: &DocsAuditOptions) -> String {
     if !options.agent_model.trim().is_empty() {
         command.push("--agent-model".to_string());
         command.push(shell_quote(&options.agent_model));
+    }
+
+    if let Some(endpoint) = &options.agent_azure_endpoint {
+        command.push("--agent-azure-endpoint".to_string());
+        command.push(shell_quote(endpoint));
+    }
+
+    if let Some(deployment) = &options.agent_azure_deployment {
+        command.push("--agent-azure-deployment".to_string());
+        command.push(shell_quote(deployment));
+    }
+
+    if options.agent_provider == AgentProvider::AzureOpenAi
+        || options.agent_azure_api_version != DEFAULT_AZURE_OPENAI_API_VERSION
+    {
+        command.push("--agent-azure-api-version".to_string());
+        command.push(shell_quote(&options.agent_azure_api_version));
+        command.push("--agent-azure-api-key-env".to_string());
+        command.push(options.agent_azure_api_key_env.clone());
     }
 
     if let Some(json_output) = &options.json_output {
@@ -1133,7 +1204,13 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-struct AgentClient {
+enum AgentClient {
+    OpenAiCompatible(OpenAiCompatibleAgentClient),
+    RigOpenAi(RigOpenAiAgentClient),
+    RigAzureOpenAi(RigAzureOpenAiAgentClient),
+}
+
+struct OpenAiCompatibleAgentClient {
     client: Client,
     base_url: String,
     api_key: String,
@@ -1142,33 +1219,108 @@ struct AgentClient {
 
 impl AgentClient {
     fn new(options: &DocsAuditOptions) -> Result<Self> {
-        if options.agent_model.trim().is_empty() {
-            return Err(anyhow!(
-                "missing audit agent model; pass --agent-model or set SDKCHECK_AGENT_MODEL"
-            ));
+        match options.agent_provider {
+            AgentProvider::OpenAiCompatible => {
+                let model = required_agent_model(options)?;
+                let api_key = std::env::var(&options.agent_api_key_env).with_context(|| {
+                    format!(
+                        "missing audit agent API key in `{}`",
+                        options.agent_api_key_env
+                    )
+                })?;
+
+                let client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(90))
+                    .build()
+                    .context("failed to build audit agent HTTP client")?;
+
+                Ok(Self::OpenAiCompatible(OpenAiCompatibleAgentClient {
+                    client,
+                    base_url: options.agent_base_url.trim_end_matches('/').to_string(),
+                    api_key,
+                    model,
+                }))
+            }
+            AgentProvider::OpenAi => {
+                let model = required_agent_model(options)?;
+                let api_key = std::env::var(&options.agent_api_key_env).with_context(|| {
+                    format!(
+                        "missing audit agent API key in `{}`",
+                        options.agent_api_key_env
+                    )
+                })?;
+
+                Ok(Self::RigOpenAi(RigOpenAiAgentClient { api_key, model }))
+            }
+            AgentProvider::AzureOpenAi => {
+                let deployment = options
+                    .agent_azure_deployment
+                    .as_deref()
+                    .filter(|deployment| !deployment.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| options.agent_model.clone());
+                if deployment.trim().is_empty() {
+                    return Err(anyhow!(
+                        "missing Azure OpenAI deployment for audit agent; pass --agent-azure-deployment, set SDKCHECK_AGENT_AZURE_OPENAI_DEPLOYMENT, or set SDKCHECK_AGENT_MODEL"
+                    ));
+                }
+
+                let endpoint = options
+                    .agent_azure_endpoint
+                    .as_deref()
+                    .filter(|endpoint| !endpoint.trim().is_empty())
+                    .map(|endpoint| endpoint.trim_end_matches('/').to_string())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "missing Azure OpenAI endpoint for audit agent; pass --agent-azure-endpoint or set SDKCHECK_AGENT_AZURE_OPENAI_ENDPOINT"
+                        )
+                    })?;
+
+                let api_key =
+                    std::env::var(&options.agent_azure_api_key_env).with_context(|| {
+                        format!(
+                            "missing Azure OpenAI audit agent API key in `{}`",
+                            options.agent_azure_api_key_env
+                        )
+                    })?;
+
+                Ok(Self::RigAzureOpenAi(RigAzureOpenAiAgentClient {
+                    api_key,
+                    endpoint,
+                    deployment,
+                    api_version: options.agent_azure_api_version.clone(),
+                }))
+            }
         }
-
-        let api_key = std::env::var(&options.agent_api_key_env).with_context(|| {
-            format!(
-                "missing audit agent API key in `{}`",
-                options.agent_api_key_env
-            )
-        })?;
-
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
-            .build()
-            .context("failed to build audit agent HTTP client")?;
-
-        Ok(Self {
-            client,
-            base_url: options.agent_base_url.trim_end_matches('/').to_string(),
-            api_key,
-            model: options.agent_model.clone(),
-        })
     }
 
     fn next_action(&self, prompt: &str) -> Result<AgentAction> {
+        let content = match self {
+            Self::OpenAiCompatible(client) => client.next_response(prompt),
+            Self::RigOpenAi(client) => client.next_response(prompt),
+            Self::RigAzureOpenAi(client) => client.next_response(prompt),
+        }?;
+
+        let json_body = extract_json_object(&content)?;
+        serde_json::from_str::<AgentAction>(&json_body)
+            .with_context(|| format!("failed to parse audit agent action:\n{}", content.trim()))
+    }
+}
+
+struct RigOpenAiAgentClient {
+    api_key: String,
+    model: String,
+}
+
+struct RigAzureOpenAiAgentClient {
+    api_key: String,
+    endpoint: String,
+    deployment: String,
+    api_version: String,
+}
+
+impl OpenAiCompatibleAgentClient {
+    fn next_response(&self, prompt: &str) -> Result<String> {
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
@@ -1180,7 +1332,7 @@ impl AgentClient {
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are sdkcheck's audit agent. Return one JSON object only."
+                        "content": AGENT_SYSTEM_PROMPT
                     },
                     {
                         "role": "user",
@@ -1203,11 +1355,62 @@ impl AgentClient {
             ));
         }
 
-        let content = extract_message_content(&body)?;
-        let json_body = extract_json_object(&content)?;
-        serde_json::from_str::<AgentAction>(&json_body)
-            .with_context(|| format!("failed to parse audit agent action:\n{}", content.trim()))
+        extract_message_content(&body)
     }
+}
+
+impl RigOpenAiAgentClient {
+    fn next_response(&self, prompt: &str) -> Result<String> {
+        let client = openai::Client::new(self.api_key.clone())
+            .context("failed to build Rig OpenAI audit agent client")?;
+        let agent = client
+            .agent(self.model.clone())
+            .preamble(AGENT_SYSTEM_PROMPT)
+            .max_tokens(MAX_AGENT_RESPONSE_TOKENS)
+            .build();
+
+        block_on_agent(agent.prompt(prompt)).context("failed to contact OpenAI audit agent")
+    }
+}
+
+impl RigAzureOpenAiAgentClient {
+    fn next_response(&self, prompt: &str) -> Result<String> {
+        let client = azure::Client::builder()
+            .api_key(azure::AzureOpenAIAuth::ApiKey(self.api_key.clone()))
+            .azure_endpoint(self.endpoint.clone())
+            .api_version(&self.api_version)
+            .build()
+            .context("failed to build Rig Azure OpenAI audit agent client")?;
+        let agent = client
+            .agent(self.deployment.clone())
+            .preamble(AGENT_SYSTEM_PROMPT)
+            .max_tokens(MAX_AGENT_RESPONSE_TOKENS)
+            .build();
+
+        block_on_agent(agent.prompt(prompt)).context("failed to contact Azure OpenAI audit agent")
+    }
+}
+
+fn required_agent_model(options: &DocsAuditOptions) -> Result<String> {
+    if options.agent_model.trim().is_empty() {
+        return Err(anyhow!(
+            "missing audit agent model; pass --agent-model or set SDKCHECK_AGENT_MODEL"
+        ));
+    }
+
+    Ok(options.agent_model.clone())
+}
+
+fn block_on_agent<F>(future: F) -> Result<String>
+where
+    F: std::future::IntoFuture<Output = Result<String, rig_core::completion::PromptError>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start audit agent async runtime")?;
+
+    runtime.block_on(future.into_future()).map_err(Into::into)
 }
 
 fn extract_message_content(body: &str) -> Result<String> {
@@ -1262,8 +1465,8 @@ mod tests {
     use crate::runner::Backend;
 
     use super::{
-        DocsAuditOptions, audit_target_name, extract_json_object, load_docs_selection, run,
-        truncate_text,
+        AgentProvider, DEFAULT_AZURE_OPENAI_API_VERSION, DocsAuditOptions, audit_target_name,
+        extract_json_object, load_docs_selection, run, truncate_text,
     };
 
     #[test]
@@ -1278,6 +1481,22 @@ mod tests {
         assert_eq!(
             audit_target_name(&["https://docs.example.com/api/latest/".to_string()]),
             "docs-example-com"
+        );
+    }
+
+    #[test]
+    fn parses_agent_provider_names() {
+        assert_eq!(
+            AgentProvider::parse("openai-compatible").expect("provider"),
+            AgentProvider::OpenAiCompatible
+        );
+        assert_eq!(
+            AgentProvider::parse("openai").expect("provider"),
+            AgentProvider::OpenAi
+        );
+        assert_eq!(
+            AgentProvider::parse("aoai").expect("provider"),
+            AgentProvider::AzureOpenAi
         );
     }
 
@@ -1339,9 +1558,14 @@ mod tests {
             json_output: Some(json_output),
             timeout_seconds: 120,
             forwarded_env_names: Vec::new(),
+            agent_provider: AgentProvider::OpenAiCompatible,
             agent_base_url: server.base_url(),
             agent_model: "sdkcheck-test-model".to_string(),
             agent_api_key_env: "SDKCHECK_TEST_AGENT_KEY".to_string(),
+            agent_azure_endpoint: None,
+            agent_azure_deployment: None,
+            agent_azure_api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
+            agent_azure_api_key_env: "SDKCHECK_TEST_AZURE_AGENT_KEY".to_string(),
             max_steps: 4,
         })
         .expect("audit report");

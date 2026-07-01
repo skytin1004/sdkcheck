@@ -19,7 +19,8 @@ The format follows the spirit of Keep a Changelog, and sdkcheck uses semantic ve
 - Baseline Docker command guardrails with named containers, `no-new-privileges`, PID limit, memory limit, and CPU limit.
 - Tag-based GitHub Release workflow for Linux, macOS, and Windows binaries with SHA256 checksums.
 - README positioning and CLI guidance for the agent-audit direction.
-- Generic `docs + goal + success criteria + agent endpoint` audit input model.
+- Generic `docs + goal + success criteria + agent provider` audit input model.
+- Rig-backed audit agent providers for direct OpenAI and Azure OpenAI.
 - First open-source project files: contributing guide, security policy, code of conduct, CI, release workflow, and issue templates.
 
 ### Known Gaps

@@ -42,6 +42,7 @@ Security boundaries today:
 - The local backend requires explicit opt-in.
 - Local `.env` files are loaded for convenience, but `.env` files are not copied into the isolated workspace.
 - Forwarded env values are passed only by requested environment variable name.
+- sdkcheck audit agent credentials use the `SDKCHECK_AGENT_*` namespace and are not forwarded into the audited runtime unless explicitly allowlisted with `--env`.
 - Forwarded env values are masked in command output and rendered reports.
 - Audit commands have a per-command timeout.
 - Docker audit commands run with named containers and fixed baseline resource/security limits.
@@ -53,4 +54,4 @@ Known gaps:
 - Docker resource limits are fixed defaults and are not configurable yet.
 - Local backend timeout cleanup is best-effort for child process trees.
 - Markdown and JSON reports are evidence artifacts, not machine-enforced redaction proof.
-- The current audit loop depends on an OpenAI-compatible model response contract and prompt quality.
+- The current audit loop depends on the configured model provider returning the required JSON action contract.
