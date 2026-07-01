@@ -30,7 +30,7 @@ body:
     attributes:
       label: Command
       description: Paste the sdkcheck command without secret values.
-      placeholder: sdkcheck run --repo https://github.com/acme/product.git --goal "Install the product and complete the quickstart." --env OPENAI_API_KEY --env OPENAI_CHAT_MODEL_ID
+      placeholder: sdkcheck run --docs https://docs.acme.dev/quickstart --goal "Install the SDK and complete the quickstart." --env ACME_API_KEY
     validations:
       required: true
   - type: textarea

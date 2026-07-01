@@ -1,6 +1,6 @@
 # Security Policy
 
-sdkcheck executes agent-driven product audits and can pass API keys into those audits. Treat it like a CI runner that may touch real provider credentials.
+sdkcheck executes agent-driven docs audits and can pass API keys into those audits. Treat it like a CI runner that may touch real provider credentials.
 
 ## Supported Versions
 
@@ -30,7 +30,7 @@ After GitHub private vulnerability reporting is enabled for [github.com/skytin10
 
 sdkcheck currently assumes:
 
-- The user controls which audit target runs.
+- The user controls which docs and workspace are audited.
 - The user controls which forwarded env names are passed.
 - The Docker daemon is trusted.
 - The product under test may be buggy or hostile.
@@ -40,6 +40,7 @@ Security boundaries today:
 
 - Docker is the default backend.
 - The local backend requires explicit opt-in.
+- Local `.env` files are loaded for convenience, but `.env` files are not copied into the isolated workspace.
 - Forwarded env values are passed only by requested environment variable name.
 - Forwarded env values are masked in command output and rendered reports.
 - Audit commands have a per-command timeout.

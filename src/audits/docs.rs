@@ -5,6 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
+use reqwest::Url;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -24,8 +25,8 @@ const MAX_AGENT_RESPONSE_TOKENS: u64 = 800;
 #[derive(Debug, Clone)]
 pub struct DocsAuditOptions {
     pub backend: Backend,
-    pub repo: String,
-    pub docs: Vec<PathBuf>,
+    pub docs: Vec<String>,
+    pub workspace: Option<PathBuf>,
     pub goal: String,
     pub success_criteria: Vec<String>,
     pub workdir: PathBuf,
@@ -57,14 +58,14 @@ enum AgentVerdict {
 
 #[derive(Debug, Clone)]
 struct DocsSelection {
-    doc_paths: Vec<PathBuf>,
+    sources: Vec<String>,
     bundle: String,
     observations: Vec<String>,
 }
 
 struct AgentLoop<'a> {
     options: &'a DocsAuditOptions,
-    repo_dir: &'a Path,
+    workspace_dir: &'a Path,
     docs_selection: &'a DocsSelection,
     runner: &'a CommandRunner,
     forwarded_envs: &'a SecretSet,
@@ -125,10 +126,18 @@ enum FinishClassification {
 }
 
 pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
-    let run_dir = create_run_dir(&options.workdir, &options.repo)?;
+    let run_dir = create_run_dir(&options.workdir, &options.docs)?;
+    let workspace_dir = run_dir.join("workspace");
     let mut audit_steps = Vec::new();
     let mut docs_observations = Vec::new();
     let mut commands = Vec::new();
+
+    fs::create_dir_all(&workspace_dir).with_context(|| {
+        format!(
+            "failed to create isolated workspace `{}`",
+            workspace_dir.display()
+        )
+    })?;
 
     CommandRunner::new(options.backend, &run_dir, SecretSet::default())
         .with_timeout_seconds(options.timeout_seconds)
@@ -137,45 +146,41 @@ pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
     let forwarded_envs = SecretSet::from_env_names(&options.forwarded_env_names);
     let runner = CommandRunner::new(options.backend, &run_dir, forwarded_envs.clone())
         .with_timeout_seconds(options.timeout_seconds);
-    let clone_runner = CommandRunner::new(Backend::Local, &run_dir, SecretSet::default())
-        .with_timeout_seconds(options.timeout_seconds);
-    let clone_source = clone_source(&options.repo)?;
 
-    audit_steps.push(format!(
-        "Clone audit repository `{}` into the isolated run directory.",
-        options.repo
-    ));
-    let cloned = record_command(
-        &mut commands,
-        clone_runner.run(
-            CommandSpec::new("clone audit repository", "git", &run_dir).args([
-                "clone",
-                "--depth",
-                "1",
-                &clone_source,
-                "repo",
-            ]),
-        ),
-    )?;
-
-    let repo_dir = run_dir.join("repo");
     let mut finish = None;
     let mut baseline_snapshot = BTreeMap::new();
 
-    if cloned {
-        match load_docs_selection(&repo_dir, &options.docs) {
+    match prepare_workspace(&options, &workspace_dir) {
+        Ok(Some(source)) => audit_steps.push(format!(
+            "Copy workspace `{}` into the isolated audit runtime.",
+            source.display()
+        )),
+        Ok(None) => audit_steps
+            .push("Create an empty isolated workspace for the docs-driven audit.".to_string()),
+        Err(error) => {
+            docs_observations.push(format!("Failed to prepare workspace: {error:#}"));
+            finish = Some(AgentFinish {
+                verdict: AgentVerdict::Failed,
+                classification: FailureClassification::Environment,
+                summary: format!("sdkcheck could not prepare the audit workspace: {error:#}"),
+                suggestions: vec![
+                    "Pass a valid --workspace directory or use URL docs that do not require a local checkout."
+                        .to_string(),
+                ],
+                missing_envs: Vec::new(),
+            });
+        }
+    }
+
+    if finish.is_none() {
+        match load_docs_selection(&workspace_dir, &options.docs) {
             Ok(selection) => {
                 audit_steps.push(format!(
                     "Load seed docs for the agent: {}.",
-                    selection
-                        .doc_paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    selection.sources.join(", ")
                 ));
                 docs_observations.extend(selection.observations.iter().cloned());
-                baseline_snapshot = snapshot_tree(&repo_dir)?;
+                baseline_snapshot = snapshot_tree(&workspace_dir)?;
 
                 let agent = match AgentClient::new(&options) {
                     Ok(agent) => Some(agent),
@@ -204,7 +209,7 @@ pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
                     finish = Some(
                         AgentLoop {
                             options: &options,
-                            repo_dir: &repo_dir,
+                            workspace_dir: &workspace_dir,
                             docs_selection: &selection,
                             runner: &runner,
                             forwarded_envs: &forwarded_envs,
@@ -224,7 +229,7 @@ pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
                     classification: FailureClassification::Docs,
                     summary: format!("sdkcheck could not load the requested docs: {error:#}"),
                     suggestions: vec![
-                        "Pass valid --docs paths or make sure README.md/docs/*.md exist in the target repository."
+                        "Pass valid --docs paths or URLs. Local docs must be inside --workspace."
                             .to_string(),
                     ],
                     missing_envs: Vec::new(),
@@ -233,8 +238,8 @@ pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
         }
     }
 
-    let generated_files = if repo_dir.exists() {
-        changed_files(&repo_dir, &baseline_snapshot)?
+    let generated_files = if workspace_dir.exists() {
+        changed_files(&workspace_dir, &baseline_snapshot)?
     } else {
         Vec::new()
     };
@@ -256,7 +261,7 @@ pub fn run(options: DocsAuditOptions) -> Result<AuditReport> {
     let report = AuditReport {
         title: format!(
             "sdkcheck audit report: {}",
-            audit_target_name(&options.repo)
+            audit_target_name(&options.docs)
         ),
         status,
         classification,
@@ -288,9 +293,9 @@ impl AgentLoop<'_> {
             format!(
                 "Seed docs: {}",
                 self.docs_selection
-                    .doc_paths
+                    .sources
                     .iter()
-                    .map(|path| path.display().to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -323,7 +328,7 @@ impl AgentLoop<'_> {
                 self.docs_selection,
                 &observations,
                 step,
-                self.repo_dir,
+                self.workspace_dir,
                 self.forwarded_envs,
             );
 
@@ -347,7 +352,7 @@ impl AgentLoop<'_> {
 
             match action {
                 AgentAction::ReadFile { summary, path } => {
-                    let resolved = match resolve_relative_path(self.repo_dir, &path) {
+                    let resolved = match resolve_relative_path(self.workspace_dir, &path) {
                         Ok(path) => path,
                         Err(error) => {
                             observations.push(format!(
@@ -361,7 +366,7 @@ impl AgentLoop<'_> {
                     };
 
                     let relative = resolved
-                        .strip_prefix(self.repo_dir)
+                        .strip_prefix(self.workspace_dir)
                         .unwrap_or(&resolved)
                         .to_path_buf();
                     let content = match read_text_file(&resolved, MAX_FILE_READ_BYTES) {
@@ -399,7 +404,7 @@ impl AgentLoop<'_> {
                     cwd,
                 } => {
                     let cwd_text = cwd.unwrap_or_else(|| ".".to_string());
-                    let resolved_cwd = match resolve_relative_path(self.repo_dir, &cwd_text) {
+                    let resolved_cwd = match resolve_relative_path(self.workspace_dir, &cwd_text) {
                         Ok(path) => path,
                         Err(error) => {
                             observations.push(format!(
@@ -438,7 +443,7 @@ impl AgentLoop<'_> {
                                 label: command_label,
                                 command: "[sdkcheck internal failure before command start]"
                                     .to_string(),
-                                cwd: self.repo_dir.to_path_buf(),
+                                cwd: self.workspace_dir.to_path_buf(),
                                 exit_code: None,
                                 success: false,
                                 timed_out: false,
@@ -501,7 +506,7 @@ fn build_agent_prompt(
     docs_selection: &DocsSelection,
     observations: &[String],
     step: u32,
-    repo_dir: &Path,
+    workspace_dir: &Path,
     forwarded_envs: &SecretSet,
 ) -> String {
     let success_criteria = if options.success_criteria.is_empty() {
@@ -525,7 +530,7 @@ fn build_agent_prompt(
     format!(
         "You are sdkcheck's audit agent.\n\
          Audit step: {step}\n\
-         Repository root: {repo_root}\n\
+         Workspace root: {workspace_root}\n\
          Goal: {goal}\n\
          Success criteria:\n{success_criteria}\n\
          Forwarded env names available to commands: {env_names}\n\
@@ -534,20 +539,22 @@ fn build_agent_prompt(
          Observations so far:\n- {observations}\n\
          Return exactly one JSON object and nothing else.\n\
          Allowed actions:\n\
-         1. {{\"kind\":\"read_file\",\"summary\":\"why you need it\",\"path\":\"relative/path/from/repo\"}}\n\
-         2. {{\"kind\":\"run_command\",\"summary\":\"why you are running it\",\"label\":\"short human label\",\"program\":\"python\",\"args\":[\"-m\",\"pip\",\"install\",\".\"],\"cwd\":\"relative/path/from/repo\"}}\n\
+         1. {{\"kind\":\"read_file\",\"summary\":\"why you need it\",\"path\":\"relative/path/from/workspace\"}}\n\
+         2. {{\"kind\":\"run_command\",\"summary\":\"why you are running it\",\"label\":\"short human label\",\"program\":\"python\",\"args\":[\"-m\",\"pip\",\"install\",\"example-sdk\"],\"cwd\":\"relative/path/from/workspace\"}}\n\
          3. {{\"kind\":\"finish\",\"summary\":\"final verdict summary\",\"verdict\":\"passed|failed|inconclusive\",\"classification\":\"none|docs|product|environment|unclear-audit\",\"suggestions\":[\"next action\"],\"missing_envs\":[\"ENV_NAME\"]}}\n\
          Rules:\n\
          - Do not use markdown fences.\n\
          - Do not use shell operators such as &&, ||, ;, |, >, or <.\n\
          - Use explicit programs and args.\n\
-         - Keep cwd inside the repository root.\n\
+         - Keep cwd inside the workspace root.\n\
          - Read files before guessing when the docs are unclear.\n\
+         - Do not attempt interactive browser login or API key creation.\n\
+         - Finish with `environment` and list missing_envs if credentials are required but not available.\n\
          - Finish with `environment` if missing credentials or host prerequisites block the documented flow.\n\
          - Finish with `docs` if the documented flow is wrong or incomplete.\n\
          - Finish with `product` if the docs look reasonable but the product behavior is broken.\n\
          - Finish with `none` only when the goal is actually complete.\n",
-        repo_root = repo_dir.display(),
+        workspace_root = workspace_dir.display(),
         goal = options.goal,
         success_criteria = success_criteria,
         env_names = env_names,
@@ -557,35 +564,46 @@ fn build_agent_prompt(
     )
 }
 
-fn load_docs_selection(repo_dir: &Path, requested_docs: &[PathBuf]) -> Result<DocsSelection> {
-    let doc_paths = if requested_docs.is_empty() {
-        auto_discover_docs(repo_dir)?
-    } else {
-        requested_docs
-            .iter()
-            .map(|path| {
-                let resolved = resolve_relative_path(repo_dir, path)?;
-                resolved
-                    .strip_prefix(repo_dir)
-                    .map(|path| path.to_path_buf())
-                    .map_err(|error| anyhow!(error))
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    if doc_paths.is_empty() {
-        return Err(anyhow!(
-            "no docs were found; pass --docs explicitly or make sure README.md/docs/*.md exist"
-        ));
+fn load_docs_selection(workspace_dir: &Path, requested_docs: &[String]) -> Result<DocsSelection> {
+    if requested_docs.is_empty() {
+        return Err(anyhow!("at least one --docs path or URL is required"));
     }
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .user_agent("sdkcheck/0.1")
+        .build()
+        .context("failed to build docs HTTP client")?;
 
     let mut bundle = String::new();
     let mut total_bytes = 0;
-    for path in &doc_paths {
-        let content = read_text_file(&repo_dir.join(path), MAX_DOC_FILE_BYTES)?;
-        let chunk = format!("FILE: {}\n```text\n{}\n```\n\n", path.display(), content);
+    let mut sources = Vec::new();
+    let mut observations = Vec::new();
+
+    for source in requested_docs {
+        let content = if is_http_url(source) {
+            let content = fetch_doc_url(&client, source)?;
+            observations.push(format!("Fetched docs URL `{source}`."));
+            content
+        } else {
+            let resolved = resolve_relative_path(workspace_dir, source)?;
+            let relative = resolved
+                .strip_prefix(workspace_dir)
+                .unwrap_or(&resolved)
+                .display()
+                .to_string();
+            let content = read_text_file(&resolved, MAX_DOC_FILE_BYTES)?;
+            observations.push(format!("Loaded local doc `{relative}`."));
+            content
+        };
+
+        sources.push(source.clone());
+        let chunk = format!("SOURCE: {source}\n```text\n{}\n```\n\n", content);
 
         if total_bytes + chunk.len() > MAX_DOC_BUNDLE_BYTES {
+            observations.push(format!(
+                "Stopped adding docs to the prompt after `{source}` because the docs bundle hit the size limit."
+            ));
             break;
         }
 
@@ -593,77 +611,137 @@ fn load_docs_selection(repo_dir: &Path, requested_docs: &[PathBuf]) -> Result<Do
         bundle.push_str(&chunk);
     }
 
-    let observations = vec![format!(
-        "Loaded {} doc file(s): {}.",
-        doc_paths.len(),
-        doc_paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )];
+    if bundle.trim().is_empty() {
+        return Err(anyhow!("no readable docs were loaded"));
+    }
 
     Ok(DocsSelection {
-        doc_paths,
+        sources,
         bundle,
         observations,
     })
 }
 
-fn auto_discover_docs(repo_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut docs = Vec::new();
-    let readme = repo_dir.join("README.md");
-    if readme.exists() {
-        docs.push(PathBuf::from("README.md"));
+fn fetch_doc_url(client: &Client, source: &str) -> Result<String> {
+    let url = Url::parse(source).with_context(|| format!("invalid docs URL `{source}`"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(anyhow!("unsupported docs URL scheme `{scheme}`")),
     }
 
-    let docs_dir = repo_dir.join("docs");
-    if docs_dir.is_dir() {
-        collect_markdown_files(&docs_dir, repo_dir, &mut docs)?;
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("failed to fetch docs URL `{source}`"))?;
+    let status = response.status();
+    let content = response
+        .text()
+        .with_context(|| format!("failed to read docs URL `{source}`"))?;
+
+    if !status.is_success() {
+        return Err(anyhow!(
+            "docs URL `{}` returned HTTP {}:\n{}",
+            source,
+            status,
+            truncate_text(&content, MAX_DOC_FILE_BYTES)
+        ));
     }
 
-    if docs.is_empty() {
-        collect_markdown_files(repo_dir, repo_dir, &mut docs)?;
-    }
-
-    docs.sort();
-    docs.dedup();
-    Ok(docs)
+    Ok(truncate_text(&content, MAX_DOC_FILE_BYTES))
 }
 
-fn collect_markdown_files(dir: &Path, repo_dir: &Path, docs: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("failed to read directory `{}`", dir.display()))?
+fn is_http_url(source: &str) -> bool {
+    source.starts_with("https://") || source.starts_with("http://")
+}
+
+fn docs_contain_local_path(docs: &[String]) -> bool {
+    docs.iter().any(|source| !is_http_url(source))
+}
+
+fn prepare_workspace(options: &DocsAuditOptions, workspace_dir: &Path) -> Result<Option<PathBuf>> {
+    let source = match &options.workspace {
+        Some(workspace) => Some(resolve_workspace_path(workspace)?),
+        None if docs_contain_local_path(&options.docs) => {
+            Some(std::env::current_dir().context("failed to resolve current directory")?)
+        }
+        None => None,
+    };
+
+    if let Some(source) = source {
+        copy_workspace(&source, workspace_dir)?;
+        return Ok(Some(source));
+    }
+
+    Ok(None)
+}
+
+fn resolve_workspace_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path)
+    };
+    let canonical = fs::canonicalize(&absolute).unwrap_or(absolute);
+    if !canonical.is_dir() {
+        return Err(anyhow!(
+            "workspace `{}` is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
+    copy_workspace_inner(source, source, destination)
+}
+
+fn copy_workspace_inner(root: &Path, current: &Path, destination_root: &Path) -> Result<()> {
+    for entry in fs::read_dir(current)
+        .with_context(|| format!("failed to read workspace directory `{}`", current.display()))?
     {
         let entry = entry?;
         let path = entry.path();
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            if should_skip_dir(&entry.file_name().to_string_lossy()) {
+            if should_skip_dir(&name_text) {
                 continue;
             }
-            collect_markdown_files(&path, repo_dir, docs)?;
+            copy_workspace_inner(root, &path, destination_root)?;
             continue;
         }
 
-        if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        {
-            docs.push(
-                path.strip_prefix(repo_dir)
-                    .with_context(|| {
-                        format!(
-                            "failed to make doc path `{}` relative to `{}`",
-                            path.display(),
-                            repo_dir.display()
-                        )
-                    })?
-                    .to_path_buf(),
-            );
+        if !file_type.is_file() || should_skip_file(&name_text) {
+            continue;
         }
+
+        let relative = path.strip_prefix(root).with_context(|| {
+            format!(
+                "failed to make workspace path `{}` relative to `{}`",
+                path.display(),
+                root.display()
+            )
+        })?;
+        let destination = destination_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create workspace copy directory `{}`",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::copy(&path, &destination).with_context(|| {
+            format!(
+                "failed to copy workspace file `{}` to `{}`",
+                path.display(),
+                destination.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -672,11 +750,22 @@ fn collect_markdown_files(dir: &Path, repo_dir: &Path, docs: &mut Vec<PathBuf>) 
 fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".venv" | "__pycache__" | "node_modules" | "target" | "dist"
+        ".git"
+            | ".venv"
+            | ".sdkcheck-work"
+            | "__pycache__"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "reports"
     )
 }
 
-fn create_run_dir(workdir: &Path, repo: &str) -> Result<PathBuf> {
+fn should_skip_file(name: &str) -> bool {
+    name == ".env" || (name.starts_with(".env.") && name != ".env.example")
+}
+
+fn create_run_dir(workdir: &Path, docs: &[String]) -> Result<PathBuf> {
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
     let base = if workdir.is_absolute() {
         workdir.to_path_buf()
@@ -687,23 +776,29 @@ fn create_run_dir(workdir: &Path, repo: &str) -> Result<PathBuf> {
     };
     let run_dir = base
         .join("runs")
-        .join(format!("{}-{timestamp}", audit_target_name(repo)));
+        .join(format!("{}-{timestamp}", audit_target_name(docs)));
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create run dir `{}`", run_dir.display()))?;
     Ok(run_dir)
 }
 
-fn audit_target_name(repo: &str) -> String {
-    if let Some(local_name) = local_repo_name(repo) {
-        return docker_safe_name_like(&local_name);
+fn audit_target_name(docs: &[String]) -> String {
+    let first = docs.first().map(String::as_str).unwrap_or("audit");
+    if let Ok(url) = Url::parse(first) {
+        if let Some(host) = url.host_str() {
+            return docker_safe_name_like(host);
+        }
     }
 
-    let raw = repo
+    let raw = first
         .trim_end_matches('/')
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("audit");
-    let raw = raw.strip_suffix(".git").unwrap_or(raw);
+    let raw = raw
+        .strip_suffix(".md")
+        .or_else(|| raw.strip_suffix(".mdx"))
+        .unwrap_or(raw);
     docker_safe_name_like(raw)
 }
 
@@ -726,49 +821,6 @@ fn resolve_relative_path(root: &Path, relative: impl AsRef<Path>) -> Result<Path
     }
 
     Ok(root.join(cleaned))
-}
-
-fn clone_source(repo: &str) -> Result<String> {
-    let path = Path::new(repo);
-    if path.exists() {
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .context("failed to resolve current directory for local repository")?
-                .join(path)
-        };
-        let canonical = fs::canonicalize(&absolute).unwrap_or(absolute);
-        return Ok(normalize_host_path_for_git(&canonical));
-    }
-
-    Ok(repo.to_string())
-}
-
-fn normalize_host_path_for_git(path: &Path) -> String {
-    let rendered = path.display().to_string();
-    rendered
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&rendered)
-        .to_string()
-}
-
-fn local_repo_name(repo: &str) -> Option<String> {
-    let path = Path::new(repo);
-    if !path.exists() {
-        return None;
-    }
-
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    let absolute = fs::canonicalize(&absolute).unwrap_or(absolute);
-
-    absolute
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
 }
 
 fn docker_safe_name_like(input: &str) -> String {
@@ -911,16 +963,6 @@ fn command_observation(step: u32, result: &CommandResult) -> String {
     )
 }
 
-fn record_command(
-    commands: &mut Vec<CommandResult>,
-    result: Result<CommandResult>,
-) -> Result<bool> {
-    let command = result?;
-    let success = command.success;
-    commands.push(command);
-    Ok(success)
-}
-
 fn merged_missing_envs(forwarded_envs: &SecretSet, finish: Option<&AgentFinish>) -> Vec<String> {
     let mut names = BTreeSet::new();
     for name in forwarded_envs.missing_names() {
@@ -959,10 +1001,7 @@ fn classification_for_report(
         return FailureClassification::Environment;
     }
 
-    if let Some(command) = commands.iter().find(|command| !command.success) {
-        if command.label.contains("clone") {
-            return FailureClassification::Environment;
-        }
+    if commands.iter().any(|command| !command.success) {
         return FailureClassification::Product;
     }
 
@@ -1036,10 +1075,6 @@ fn reproduction_command(options: &DocsAuditOptions) -> String {
     let mut command = vec![
         "sdkcheck".to_string(),
         "run".to_string(),
-        "--repo".to_string(),
-        shell_quote(&options.repo),
-        "--goal".to_string(),
-        shell_quote(&options.goal),
         "--backend".to_string(),
         options.backend.to_string(),
         "--output".to_string(),
@@ -1054,6 +1089,19 @@ fn reproduction_command(options: &DocsAuditOptions) -> String {
         options.max_steps.to_string(),
     ];
 
+    for source in &options.docs {
+        command.push("--docs".to_string());
+        command.push(shell_quote(source));
+    }
+
+    if let Some(workspace) = &options.workspace {
+        command.push("--workspace".to_string());
+        command.push(shell_quote(&workspace.display().to_string()));
+    }
+
+    command.push("--goal".to_string());
+    command.push(shell_quote(&options.goal));
+
     if !options.agent_model.trim().is_empty() {
         command.push("--agent-model".to_string());
         command.push(shell_quote(&options.agent_model));
@@ -1062,11 +1110,6 @@ fn reproduction_command(options: &DocsAuditOptions) -> String {
     if let Some(json_output) = &options.json_output {
         command.push("--json-output".to_string());
         command.push(shell_quote(&json_output.display().to_string()));
-    }
-
-    for path in &options.docs {
-        command.push("--docs".to_string());
-        command.push(shell_quote(&path.display().to_string()));
     }
 
     for criterion in &options.success_criteria {
@@ -1210,7 +1253,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -1219,7 +1261,10 @@ mod tests {
     use crate::models::{FailureClassification, ReportStatus};
     use crate::runner::Backend;
 
-    use super::{DocsAuditOptions, audit_target_name, extract_json_object, run, truncate_text};
+    use super::{
+        DocsAuditOptions, audit_target_name, extract_json_object, load_docs_selection, run,
+        truncate_text,
+    };
 
     #[test]
     fn extracts_json_from_wrapped_response() {
@@ -1229,10 +1274,10 @@ mod tests {
     }
 
     #[test]
-    fn target_name_strips_git_suffix() {
+    fn target_name_uses_docs_url_host() {
         assert_eq!(
-            audit_target_name("https://github.com/acme/demo.git"),
-            "demo"
+            audit_target_name(&["https://docs.example.com/api/latest/".to_string()]),
+            "docs-example-com"
         );
     }
 
@@ -1246,21 +1291,33 @@ mod tests {
     }
 
     #[test]
+    fn loads_docs_from_url() {
+        let server = MockDocsServer::start("# API\n\nInstall the SDK and call the API.\n");
+        let temp_root = unique_temp_dir("sdkcheck-docs-url-test");
+
+        let selection =
+            load_docs_selection(&temp_root, &[server.url()]).expect("load docs from URL");
+
+        assert!(selection.sources[0].starts_with("http://127.0.0.1:"));
+        assert!(selection.bundle.contains("Install the SDK"));
+        assert!(
+            selection
+                .observations
+                .iter()
+                .any(|observation| observation.contains("Fetched docs URL"))
+        );
+    }
+
+    #[test]
     fn runs_a_generic_docs_audit_with_a_mock_agent() {
         let temp_root = unique_temp_dir("sdkcheck-audit-test");
-        let repo_dir = temp_root.join("repo-source");
-        fs::create_dir_all(&repo_dir).expect("repo dir");
+        let workspace_dir = temp_root.join("workspace-source");
+        fs::create_dir_all(&workspace_dir).expect("workspace dir");
         fs::write(
-            repo_dir.join("README.md"),
-            "# Demo\n\nRun `git status --short` to verify the repo is clean.\n",
+            workspace_dir.join("README.md"),
+            "# Demo\n\nRun `git --version` to verify the documented command works.\n",
         )
         .expect("write readme");
-
-        run_git(&repo_dir, &["init", "--initial-branch=main"]);
-        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
-        run_git(&repo_dir, &["config", "user.name", "sdkcheck test"]);
-        run_git(&repo_dir, &["add", "README.md"]);
-        run_git(&repo_dir, &["commit", "-m", "init"]);
 
         let server = MockAgentServer::start();
         let workdir = temp_root.join("work");
@@ -1273,10 +1330,10 @@ mod tests {
 
         let report = run(DocsAuditOptions {
             backend: Backend::Local,
-            repo: repo_dir.display().to_string(),
-            docs: vec![PathBuf::from("README.md")],
-            goal: "Verify the documented git command works.".to_string(),
-            success_criteria: vec!["`git status --short` exits with status 0.".to_string()],
+            docs: vec!["README.md".to_string()],
+            workspace: Some(workspace_dir),
+            goal: "Verify the documented command works.".to_string(),
+            success_criteria: vec!["`git --version` exits with status 0.".to_string()],
             workdir,
             output,
             json_output: Some(json_output),
@@ -1295,7 +1352,7 @@ mod tests {
 
         assert_eq!(report.status, ReportStatus::Passed);
         assert_eq!(report.classification, FailureClassification::None);
-        assert_eq!(report.commands.len(), 2);
+        assert_eq!(report.commands.len(), 1);
         assert!(report.commands.iter().all(|command| command.success));
         assert!(
             report
@@ -1313,21 +1370,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{prefix}-{timestamp}"));
         fs::create_dir_all(&path).expect("temp dir");
         path
-    }
-
-    fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     struct MockAgentServer {
@@ -1350,7 +1392,7 @@ mod tests {
 
                     let step = thread_counter.fetch_add(1, Ordering::SeqCst);
                     let content = if step == 0 {
-                        "{\"kind\":\"run_command\",\"summary\":\"verify the documented command\",\"label\":\"verify documented git command\",\"program\":\"git\",\"args\":[\"status\",\"--short\"],\"cwd\":\".\"}"
+                        "{\"kind\":\"run_command\",\"summary\":\"verify the documented command\",\"label\":\"verify documented git command\",\"program\":\"git\",\"args\":[\"--version\"],\"cwd\":\".\"}"
                     } else {
                         "{\"kind\":\"finish\",\"summary\":\"The documented command completed successfully.\",\"verdict\":\"passed\",\"classification\":\"none\",\"suggestions\":[],\"missing_envs\":[]}"
                     };
@@ -1377,6 +1419,42 @@ mod tests {
 
         fn base_url(&self) -> String {
             self.base_url.clone()
+        }
+    }
+
+    struct MockDocsServer {
+        url: String,
+        _handle: thread::JoinHandle<()>,
+    }
+
+    impl MockDocsServer {
+        fn start(content: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind docs server");
+            let port = listener.local_addr().expect("local addr").port();
+            let handle = thread::spawn(move || {
+                if let Some(stream) = listener.incoming().next() {
+                    let mut stream = stream.expect("stream");
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        content.len(),
+                        content
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write docs response");
+                }
+            });
+
+            Self {
+                url: format!("http://127.0.0.1:{port}/docs"),
+                _handle: handle,
+            }
+        }
+
+        fn url(&self) -> String {
+            self.url.clone()
         }
     }
 }

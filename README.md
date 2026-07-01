@@ -2,79 +2,74 @@
 
 # sdkcheck
 
-sdkcheck audits whether an agent can actually follow your product docs, install your product, and complete the intended usage flow.
+sdkcheck audits whether an agent can actually follow your product docs, install your product, and complete the intended flow.
 
-It does not summarize docs. It executes them.
+It does not summarize docs. It runs the scenario the docs describe.
 
-If something breaks, sdkcheck shows where it broke, which command failed, which env names were missing, and how to reproduce the result.
+The output is evidence: failing steps, command logs, missing env names, generated files, failure classification, and a reproduction command.
 
-Docs are infrastructure for agents. Humans patch over outdated commands, missing environment variables, and unclear examples. Agents do not. sdkcheck treats docs as an execution contract and records what happens when that contract meets a real runtime.
+One CLI, one job: audit whether an agent can execute the documented product scenario.
 
-In practice, sdkcheck:
+## Why
 
-- runs real commands such as `git clone`, package installation, CLI entry points, API calls, and output checks
-- uses Docker by default so the result does not depend on a preconfigured laptop or shell
-- writes Markdown and JSON reports with logs, missing env names, generated files, failure classification, and a reproduction command
+Docs are part of the runtime contract for agents. Humans compensate for stale commands, missing setup steps, and unstated secrets. Agents do not. sdkcheck makes that gap visible before your users hit it.
 
-## Product Shape
+## What sdkcheck needs
 
-The public direction is intentionally narrow:
+- docs: a local path or external URL, passed with `--docs`
+- goal: the scenario the agent must complete, passed with `--goal`
+- credentials: stored in your shell or `.env`, forwarded explicitly with `--env`
+- an OpenAI-compatible chat completions endpoint for sdkcheck's audit agent
 
-- one CLI
-- one job: audit whether an agent can execute the documented product flow
-- Docker-first execution
-- explicit env pass-through
-- evidence-first reporting
+`.env` is only a place to load values from. sdkcheck forwards only the env names you allowlist with `--env`.
 
-## Required Inputs
+## Install
 
-Each audit needs four things:
+Until crates.io packaging is ready, install from a checkout:
 
-- a target repository
-- doc files to seed the agent with, or a repo that has `README.md` / `docs/**/*.md`
-- a plain-language goal plus optional success criteria
-- an OpenAI-compatible model endpoint for sdkcheck's own audit agent
-
-The audit agent uses:
-
-- `SDKCHECK_AGENT_BASE_URL` or `--agent-base-url`
-- `SDKCHECK_AGENT_MODEL` or `--agent-model`
-- `SDKCHECK_AGENT_API_KEY` by default, or `--agent-api-key-env <ENV_NAME>`
+```bash
+git clone https://github.com/skytin1004/sdkcheck.git
+cd sdkcheck
+cargo install --path . --locked
+```
 
 ## Quick Start
 
-Point sdkcheck at a repository and tell the agent what must work:
+Create a `.env` with the audit agent configuration and any product credentials the scenario needs:
 
-```bash
-cargo run --locked -- run \
-  --repo https://github.com/acme/product.git \
-  --docs README.md \
-  --docs docs/quickstart.md \
-  --goal "Install the product and complete the quickstart." \
-  --success "The hello-world example exits with status 0." \
-  --success "The documented output file is created." \
-  --agent-base-url http://localhost:4000/v1 \
-  --agent-model gpt-4.1-mini \
-  --agent-api-key-env ANY_LLM_API_KEY \
-  --env OPENAI_API_KEY \
-  --env OPENAI_CHAT_MODEL_ID \
-  --json-output reports/run.json
+```dotenv
+SDKCHECK_AGENT_API_KEY=...
+SDKCHECK_AGENT_MODEL=gpt-4.1-mini
+
+EXAMPLE_API_KEY=...
+EXAMPLE_APP_KEY=...
+EXAMPLE_SITE=api.example.com
 ```
 
-Use the local backend only for development:
+Then point sdkcheck at the docs and describe the scenario:
 
 ```bash
 sdkcheck run \
-  --repo . \
-  --goal "Install from source and run the example CLI." \
-  --backend local \
-  --agent-model gpt-4.1-mini
+  --docs https://docs.example.com/api/latest/ \
+  --goal "Install the SDK and make one successful example API request." \
+  --env EXAMPLE_API_KEY \
+  --env EXAMPLE_APP_KEY \
+  --env EXAMPLE_SITE \
+  --json-output reports/run.json
 ```
 
-The audited runtime can receive any forwarded env names it needs. Common examples:
+Local docs use the same `--docs` flag:
 
-- `OPENAI_API_KEY` and `OPENAI_CHAT_MODEL_ID`
-- `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME`, and `AZURE_OPENAI_API_VERSION`
+```bash
+sdkcheck run \
+  --docs README.md \
+  --docs docs/quickstart.md \
+  --workspace . \
+  --goal "Install the SDK and complete the quickstart." \
+  --env ACME_API_KEY
+```
+
+If all docs are URLs, sdkcheck starts from an empty isolated workspace. If any doc is a local path, sdkcheck copies the current directory into the isolated workspace by default. Pass `--workspace <DIR>` to choose a different source directory.
 
 ## What You Get
 
@@ -85,29 +80,23 @@ status: passed
 classification: none
 ```
 
-Each report includes the failing step, command evidence, missing env names, generated files, failure classification, and a reproduction command.
+Each report includes:
 
-## Current MVP
+- the step that failed
+- the exact command and working directory
+- stdout and stderr logs
+- missing env names
+- generated files
+- a reproduction command
 
-- Rust CLI
-- Docker-first execution
-- local backend as an escape hatch
-- generic repo/docs/goal audit input model
-- one agent loop that can read files, run commands, and finish with a verdict
-- Markdown and JSON reports
-- env value masking
-- command timeouts and log truncation
-
-## Security
-
-sdkcheck executes real commands and may touch real provider credentials.
+## Safety
 
 - Docker is the default backend.
-- Local execution requires explicit opt-in.
-- Forwarded env values are passed by environment variable name.
-- Forwarded env values are masked in captured output and reports.
+- Local execution requires explicit opt-in with `--backend local`.
+- `.env` files are loaded but not copied into the isolated workspace.
+- Forwarded env values are masked in captured output and written reports.
 
-Read [SECURITY.md](SECURITY.md) before running sdkcheck against untrusted repositories or production credentials.
+Read [SECURITY.md](SECURITY.md) before auditing untrusted docs, workspaces, or production credentials.
 
 ## License
 

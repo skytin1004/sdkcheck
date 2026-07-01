@@ -27,20 +27,23 @@ enum Commands {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  sdkcheck run --repo https://github.com/acme/product.git --goal \"Install the product and complete the quickstart.\" --agent-base-url http://localhost:4000/v1 --agent-model gpt-4.1-mini --agent-api-key-env ANY_LLM_API_KEY\n  sdkcheck run --repo . --docs README.md --docs docs/quickstart.md --goal \"Install from source and run the hello-world example.\" --success \"The example exits with status 0.\" --env OPENAI_API_KEY --env OPENAI_CHAT_MODEL_ID\n"
+    after_help = "Examples:\n  sdkcheck run --docs https://docs.example.com/api/latest/ --goal \"Install the SDK and make one successful example API request.\" --env EXAMPLE_API_KEY --env EXAMPLE_APP_KEY --env EXAMPLE_SITE\n  sdkcheck run --docs README.md --docs docs/quickstart.md --goal \"Install the SDK and complete the quickstart.\" --env ACME_API_KEY\n  sdkcheck run --docs docs/quickstart.md --workspace . --goal \"Install from this checkout and run the documented example.\" --backend local\n"
 )]
 struct RunCommand {
     #[arg(
-        long,
-        help = "Git repository URL or local git repository path to audit."
+        long = "docs",
+        required = true,
+        value_name = "PATH_OR_URL",
+        help = "Documentation path or URL to seed the agent with. Pass multiple times."
     )]
-    repo: String,
+    docs: Vec<String>,
 
     #[arg(
-        long = "docs",
-        help = "Relative doc file to seed the agent with. Pass multiple times. If omitted, sdkcheck loads README.md and docs/**/*.md automatically."
+        long,
+        value_name = "DIR",
+        help = "Workspace directory to copy into the isolated audit runtime. Defaults to the current directory when local docs are used; URL-only audits start from an empty workspace."
     )]
-    docs: Vec<PathBuf>,
+    workspace: Option<PathBuf>,
 
     #[arg(
         long,
@@ -111,6 +114,7 @@ struct RunCommand {
 }
 
 pub fn run() -> Result<()> {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
 
     match cli.command {
@@ -126,8 +130,8 @@ pub fn run() -> Result<()> {
 
             let report = docs::run(DocsAuditOptions {
                 backend: command.backend,
-                repo: command.repo,
                 docs: command.docs,
+                workspace: command.workspace,
                 goal: command.goal,
                 success_criteria: command.success_criteria,
                 workdir: command.workdir,

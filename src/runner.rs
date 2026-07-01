@@ -483,8 +483,8 @@ mod tests {
     #[test]
     fn docker_container_names_are_safe_and_bounded() {
         let name = docker_container_name(
-            std::path::Path::new("co-op-translator-20260629-114348"),
-            "run live Markdown translation with a long label",
+            std::path::Path::new("docs-audit-20260629-114348"),
+            "run documented quickstart with a long label",
         );
 
         assert!(name.starts_with("sdkcheck-run-"));
